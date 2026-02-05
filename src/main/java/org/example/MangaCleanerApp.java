@@ -6,6 +6,7 @@ import java.awt.datatransfer.DataFlavor;
 import java.awt.dnd.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -16,19 +17,31 @@ public class MangaCleanerApp extends JFrame {
     private final MangaResizer mangaResizer = new MangaResizer();
 
     private final JLabel statusLabel;
+    private final JProgressBar progressBar;
 
     public MangaCleanerApp() {
-        setTitle("Manga Cleaner v4.0 (Always Ask)");
-        setSize(500, 300);
+        setTitle("Manga Cleaner v5.0 (Batch Mode)");
+        setSize(500, 350);
         setLocationRelativeTo(null);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
 
         JPanel panel = new JPanel(new BorderLayout());
-        JLabel dropLabel = new JLabel("<html><center><h2>ПЕРЕТАЩИ ФАЙЛ СЮДА</h2>PDF / EPUB</center></html>", SwingConstants.CENTER);
+        JLabel dropLabel = new JLabel("<html><center><h2>ПЕРЕТАЩИ ПАПКУ ИЛИ ФАЙЛЫ</h2>Обработаю всё сразу</center></html>", SwingConstants.CENTER);
+
+        // Панель статуса с прогресс-баром
+        JPanel statusPanel = new JPanel(new BorderLayout());
         statusLabel = new JLabel("Готов к работе", SwingConstants.CENTER);
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(5, 0, 5, 0));
+
+        progressBar = new JProgressBar(0, 100);
+        progressBar.setStringPainted(true);
+        progressBar.setVisible(false);
+
+        statusPanel.add(statusLabel, BorderLayout.NORTH);
+        statusPanel.add(progressBar, BorderLayout.SOUTH);
 
         panel.add(dropLabel, BorderLayout.CENTER);
-        panel.add(statusLabel, BorderLayout.SOUTH);
+        panel.add(statusPanel, BorderLayout.SOUTH);
 
         new DropTarget(panel, new FileDropHandler());
         add(panel);
@@ -39,92 +52,135 @@ public class MangaCleanerApp extends JFrame {
         public void drop(DropTargetDropEvent event) {
             try {
                 event.acceptDrop(DnDConstants.ACTION_COPY);
-                List<File> files = (List<File>) event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
-                for (File file : files) processAsync(file);
+                List<File> droppedFiles = (List<File>) event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+
+                // Собираем все файлы (раскрываем папки)
+                List<File> allFiles = new ArrayList<>();
+                for (File file : droppedFiles) {
+                    collectFiles(file, allFiles);
+                }
+
+                if (!allFiles.isEmpty()) {
+                    processBatchAsync(allFiles);
+                } else {
+                    JOptionPane.showMessageDialog(MangaCleanerApp.this, "Не найдено PDF или EPUB файлов.");
+                }
+
             } catch (Exception e) { showError(e); }
         }
     }
 
-    private void processAsync(File input) {
-        statusLabel.setText("Обработка: " + input.getName());
+    // Рекурсивный поиск файлов в папках
+    private void collectFiles(File root, List<File> result) {
+        if (root.isDirectory()) {
+            File[] children = root.listFiles();
+            if (children != null) {
+                for (File child : children) collectFiles(child, result);
+            }
+        } else {
+            String name = root.getName().toLowerCase();
+            if (name.endsWith(".pdf") || name.endsWith(".epub")) {
+                result.add(root);
+            }
+        }
+    }
 
-        new SwingWorker<File, Void>() {
+    private void processBatchAsync(List<File> inputs) {
+        progressBar.setVisible(true);
+        progressBar.setMaximum(inputs.size());
+        progressBar.setValue(0);
+
+        new SwingWorker<Void, String>() {
             @Override
-            protected File doInBackground() throws Exception {
-                String name = input.getName().toLowerCase();
-                File output = outputFile(input, "_clean" + (name.endsWith(".pdf") ? ".pdf" : ".epub"));
+            protected Void doInBackground() throws Exception {
+                // Переменная для хранения выбора пользователя (один раз на всю пачку)
+                AtomicReference<CropMode> batchMode = new AtomicReference<>(null);
 
-                if (name.endsWith(".pdf")) {
-                    // 1. Очистка водяных знаков
-                    System.out.println("Шаг 1: Очистка...");
-                    pdfCleaner.clean(input, output);
+                for (int i = 0; i < inputs.size(); i++) {
+                    File input = inputs.get(i);
+                    publish("Обработка (" + (i + 1) + "/" + inputs.size() + "): " + input.getName());
 
-                    // 2. ВСЕГДА показываем окно выбора размера
-                    System.out.println("Шаг 2: Подготовка превью...");
+                    String name = input.getName().toLowerCase();
+                    File output = outputFile(input, "_clean" + (name.endsWith(".pdf") ? ".pdf" : ".epub"));
 
-                    // Генерируем превью
-                    BufferedImage preview = mangaResizer.getPreviewImage(output);
+                    try {
+                        if (name.endsWith(".pdf")) {
+                            // 1. Очистка
+                            pdfCleaner.clean(input, output);
 
-                    // Если не удалось получить картинку (например, пустой PDF), просто пропускаем
-                    if (preview != null) {
-                        AtomicReference<CropMode> selectedMode = new AtomicReference<>(CropMode.SKIP);
+                            // 2. Ресайз
+                            // Если мы еще не спрашивали пользователя (batchMode == null), спрашиваем сейчас
+                            if (batchMode.get() == null) {
+                                BufferedImage preview = mangaResizer.getPreviewImage(output);
+                                if (preview != null) {
+                                    SwingUtilities.invokeAndWait(() -> {
+                                        // Показываем диалог
+                                        CropMode choice = showResizeDialog(preview, input.getName(), inputs.size());
+                                        batchMode.set(choice);
+                                    });
+                                } else {
+                                    // Если превью не вышло, ставим SKIP по умолчанию, чтобы не зависло
+                                    batchMode.set(CropMode.SKIP);
+                                }
+                            }
 
-                        // Показываем окно в потоке интерфейса
-                        SwingUtilities.invokeAndWait(() -> {
-                            CropMode choice = showResizeDialog(preview, input.getName());
-                            selectedMode.set(choice);
-                        });
+                            // Применяем выбранный режим (или тот, который только что выбрали)
+                            if (batchMode.get() != CropMode.SKIP) {
+                                mangaResizer.applyResize(output, batchMode.get());
+                            }
 
-                        // Если пользователь выбрал что-то кроме "Оставить как есть"
-                        if (selectedMode.get() != CropMode.SKIP) {
-                            System.out.println("Применяем ресайз: " + selectedMode.get());
-                            mangaResizer.applyResize(output, selectedMode.get());
+                        } else if (name.endsWith(".epub")) {
+                            epubCleaner.clean(input, output);
                         }
+                    } catch (Exception e) {
+                        e.printStackTrace(); // Логируем ошибку, но не останавливаем очередь
                     }
 
-                } else if (name.endsWith(".epub")) {
-                    epubCleaner.clean(input, output);
+                    // Обновляем прогресс бар
+                    int progress = i + 1;
+                    SwingUtilities.invokeLater(() -> progressBar.setValue(progress));
                 }
-                return output;
+                return null;
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                statusLabel.setText(chunks.get(chunks.size() - 1));
             }
 
             @Override
             protected void done() {
-                try {
-                    File result = get();
-                    statusLabel.setText("Готово!");
-                    JOptionPane.showMessageDialog(MangaCleanerApp.this, "Файл готов:\n" + result.getName());
-                } catch (Exception e) {
-                    showError(e);
-                }
+                statusLabel.setText("Готово! Обработано файлов: " + inputs.size());
+                progressBar.setVisible(false);
+                JOptionPane.showMessageDialog(MangaCleanerApp.this, "Пакетная обработка завершена!");
             }
         }.execute();
     }
 
-    private CropMode showResizeDialog(BufferedImage image, String filename) {
-        JDialog dialog = new JDialog(this, "Настройка страницы", true);
+    private CropMode showResizeDialog(BufferedImage image, String filename, int totalFiles) {
+        JDialog dialog = new JDialog(this, "Настройка пакетной обработки", true);
         dialog.setLayout(new BorderLayout());
 
-        // Показываем картинку
         if (image != null) {
-            int h = 500; // Высота окна превью
+            int h = 500;
             double s = (double) h / image.getHeight();
             int w = (int) (image.getWidth() * s);
             Image scaled = image.getScaledInstance(w, h, Image.SCALE_SMOOTH);
             dialog.add(new JScrollPane(new JLabel(new ImageIcon(scaled))), BorderLayout.CENTER);
         }
 
-        // Панель кнопок
         JPanel btnPanel = new JPanel(new GridLayout(0, 1, 5, 5));
         btnPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
-        btnPanel.add(new JLabel("<html><b>" + filename + "</b><br>Выберите действие:</html>"));
 
-        JButton b1 = new JButton("По ширине (Стандарт)");
-        JButton b2 = new JButton("По высоте");
-        JButton b3 = new JButton("Растянуть (Весь экран)");
-        JButton b4 = new JButton("Оставить как есть"); // Кнопка пропуска
+        String headerText = "<html><b>" + filename + "</b><br>" +
+                "Этот выбор применится ко всем <b>" + totalFiles + "</b> файлам в очереди!</html>";
+        btnPanel.add(new JLabel(headerText));
 
-        // Зеленая подсветка для "По ширине"
+        JButton b1 = new JButton("По ширине (Для всей папки)");
+        JButton b2 = new JButton("По высоте (Для всей папки)");
+        JButton b3 = new JButton("Растянуть (Для всей папки)");
+        JButton b4 = new JButton("Оставить как есть (Все файлы)");
+
         b1.setBackground(new Color(220, 255, 220));
 
         final CropMode[] res = {CropMode.SKIP};
@@ -134,11 +190,7 @@ public class MangaCleanerApp extends JFrame {
         b3.addActionListener(e -> { res[0] = CropMode.STRETCH; dialog.dispose(); });
         b4.addActionListener(e -> { res[0] = CropMode.SKIP; dialog.dispose(); });
 
-        btnPanel.add(b1);
-        btnPanel.add(b2);
-        btnPanel.add(b3);
-        btnPanel.add(new JSeparator());
-        btnPanel.add(b4);
+        btnPanel.add(b1); btnPanel.add(b2); btnPanel.add(b3); btnPanel.add(new JSeparator()); btnPanel.add(b4);
 
         dialog.add(btnPanel, BorderLayout.EAST);
         dialog.pack();
@@ -151,7 +203,8 @@ public class MangaCleanerApp extends JFrame {
     private File outputFile(File input, String suffix) {
         String name = input.getName();
         int dot = name.lastIndexOf(".");
-        return new File(input.getParent(), (dot == -1 ? name : name.substring(0, dot)) + suffix);
+        String base = (dot == -1) ? name : name.substring(0, dot);
+        return new File(input.getParent(), base + suffix);
     }
 
     private void showError(Exception e) {
