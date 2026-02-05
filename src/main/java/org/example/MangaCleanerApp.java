@@ -20,15 +20,14 @@ public class MangaCleanerApp extends JFrame {
     private final JProgressBar progressBar;
 
     public MangaCleanerApp() {
-        setTitle("Manga Cleaner v5.0 (Batch Mode)");
+        setTitle("Manga Cleaner v5.2 (Smart Output)");
         setSize(500, 350);
         setLocationRelativeTo(null);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
 
         JPanel panel = new JPanel(new BorderLayout());
-        JLabel dropLabel = new JLabel("<html><center><h2>ПЕРЕТАЩИ ПАПКУ ИЛИ ФАЙЛЫ</h2>Обработаю всё сразу</center></html>", SwingConstants.CENTER);
+        JLabel dropLabel = new JLabel("<html><center><h2>ПЕРЕТАЩИ ПАПКУ СЮДА</h2>Сохраню результат рядом с папкой</center></html>", SwingConstants.CENTER);
 
-        // Панель статуса с прогресс-баром
         JPanel statusPanel = new JPanel(new BorderLayout());
         statusLabel = new JLabel("Готов к работе", SwingConstants.CENTER);
         statusLabel.setBorder(BorderFactory.createEmptyBorder(5, 0, 5, 0));
@@ -54,14 +53,28 @@ public class MangaCleanerApp extends JFrame {
                 event.acceptDrop(DnDConstants.ACTION_COPY);
                 List<File> droppedFiles = (List<File>) event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
 
-                // Собираем все файлы (раскрываем папки)
+                if (droppedFiles.isEmpty()) return;
+
+                // ОПРЕДЕЛЯЕМ ПАПКУ КУДА СОХРАНЯТЬ (Родительская папка)
+                // Если кинули папку "C:/Манга/Том1", сохраним в "C:/Манга/"
+                // Если кинули файл "C:/Манга/Том1/глава.pdf", сохраним в "C:/Манга/Том1/"
+                File firstItem = droppedFiles.get(0);
+                File outputDirectory;
+
+                if (firstItem.isDirectory()) {
+                    outputDirectory = firstItem.getParentFile();
+                } else {
+                    outputDirectory = firstItem.getParentFile();
+                }
+
+                // Собираем файлы
                 List<File> allFiles = new ArrayList<>();
                 for (File file : droppedFiles) {
                     collectFiles(file, allFiles);
                 }
 
                 if (!allFiles.isEmpty()) {
-                    processBatchAsync(allFiles);
+                    processBatchAsync(allFiles, outputDirectory);
                 } else {
                     JOptionPane.showMessageDialog(MangaCleanerApp.this, "Не найдено PDF или EPUB файлов.");
                 }
@@ -70,7 +83,6 @@ public class MangaCleanerApp extends JFrame {
         }
     }
 
-    // Рекурсивный поиск файлов в папках
     private void collectFiles(File root, List<File> result) {
         if (root.isDirectory()) {
             File[] children = root.listFiles();
@@ -85,7 +97,7 @@ public class MangaCleanerApp extends JFrame {
         }
     }
 
-    private void processBatchAsync(List<File> inputs) {
+    private void processBatchAsync(List<File> inputs, File outputDir) {
         progressBar.setVisible(true);
         progressBar.setMaximum(inputs.size());
         progressBar.setValue(0);
@@ -93,38 +105,33 @@ public class MangaCleanerApp extends JFrame {
         new SwingWorker<Void, String>() {
             @Override
             protected Void doInBackground() throws Exception {
-                // Переменная для хранения выбора пользователя (один раз на всю пачку)
                 AtomicReference<CropMode> batchMode = new AtomicReference<>(null);
 
                 for (int i = 0; i < inputs.size(); i++) {
                     File input = inputs.get(i);
                     publish("Обработка (" + (i + 1) + "/" + inputs.size() + "): " + input.getName());
 
-                    String name = input.getName().toLowerCase();
-                    File output = outputFile(input, "_clean" + (name.endsWith(".pdf") ? ".pdf" : ".epub"));
+                    // Создаем файл в ЦЕЛЕВОЙ папке (рядом с исходной папкой)
+                    File output = createCleanFile(input, outputDir);
 
                     try {
+                        String name = input.getName().toLowerCase();
+
                         if (name.endsWith(".pdf")) {
-                            // 1. Очистка
                             pdfCleaner.clean(input, output);
 
-                            // 2. Ресайз
-                            // Если мы еще не спрашивали пользователя (batchMode == null), спрашиваем сейчас
                             if (batchMode.get() == null) {
                                 BufferedImage preview = mangaResizer.getPreviewImage(output);
                                 if (preview != null) {
                                     SwingUtilities.invokeAndWait(() -> {
-                                        // Показываем диалог
                                         CropMode choice = showResizeDialog(preview, input.getName(), inputs.size());
                                         batchMode.set(choice);
                                     });
                                 } else {
-                                    // Если превью не вышло, ставим SKIP по умолчанию, чтобы не зависло
                                     batchMode.set(CropMode.SKIP);
                                 }
                             }
 
-                            // Применяем выбранный режим (или тот, который только что выбрали)
                             if (batchMode.get() != CropMode.SKIP) {
                                 mangaResizer.applyResize(output, batchMode.get());
                             }
@@ -133,10 +140,9 @@ public class MangaCleanerApp extends JFrame {
                             epubCleaner.clean(input, output);
                         }
                     } catch (Exception e) {
-                        e.printStackTrace(); // Логируем ошибку, но не останавливаем очередь
+                        e.printStackTrace();
                     }
 
-                    // Обновляем прогресс бар
                     int progress = i + 1;
                     SwingUtilities.invokeLater(() -> progressBar.setValue(progress));
                 }
@@ -150,11 +156,32 @@ public class MangaCleanerApp extends JFrame {
 
             @Override
             protected void done() {
-                statusLabel.setText("Готово! Обработано файлов: " + inputs.size());
+                statusLabel.setText("Готово! Файлы сохранены в: " + outputDir.getName());
                 progressBar.setVisible(false);
-                JOptionPane.showMessageDialog(MangaCleanerApp.this, "Пакетная обработка завершена!");
+                JOptionPane.showMessageDialog(MangaCleanerApp.this,
+                        "Готово!\nФайлы сохранены в папку:\n" + outputDir.getAbsolutePath());
             }
         }.execute();
+    }
+
+    // Теперь метод принимает папку назначения
+    private File createCleanFile(File input, File targetDir) {
+        String originalName = input.getName();
+        String namePart;
+        String extPart;
+
+        int dotIndex = originalName.lastIndexOf('.');
+        if (dotIndex >= 0) {
+            namePart = originalName.substring(0, dotIndex);
+            extPart = originalName.substring(dotIndex);
+        } else {
+            namePart = originalName;
+            extPart = "";
+        }
+
+        // Чтобы избежать дублирования имени, если файл уже там есть, можно добавить счетчик,
+        // но пока просто _clean
+        return new File(targetDir, namePart + "_clean" + extPart);
     }
 
     private CropMode showResizeDialog(BufferedImage image, String filename, int totalFiles) {
@@ -173,13 +200,13 @@ public class MangaCleanerApp extends JFrame {
         btnPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
         String headerText = "<html><b>" + filename + "</b><br>" +
-                "Этот выбор применится ко всем <b>" + totalFiles + "</b> файлам в очереди!</html>";
+                "Применить ко всем <b>" + totalFiles + "</b> файлам?</html>";
         btnPanel.add(new JLabel(headerText));
 
-        JButton b1 = new JButton("По ширине (Для всей папки)");
-        JButton b2 = new JButton("По высоте (Для всей папки)");
-        JButton b3 = new JButton("Растянуть (Для всей папки)");
-        JButton b4 = new JButton("Оставить как есть (Все файлы)");
+        JButton b1 = new JButton("По ширине (Рекомендую)");
+        JButton b2 = new JButton("По высоте");
+        JButton b3 = new JButton("Растянуть");
+        JButton b4 = new JButton("Только очистка (Без ресайза)");
 
         b1.setBackground(new Color(220, 255, 220));
 
@@ -198,13 +225,6 @@ public class MangaCleanerApp extends JFrame {
         dialog.setVisible(true);
 
         return res[0];
-    }
-
-    private File outputFile(File input, String suffix) {
-        String name = input.getName();
-        int dot = name.lastIndexOf(".");
-        String base = (dot == -1) ? name : name.substring(0, dot);
-        return new File(input.getParent(), base + suffix);
     }
 
     private void showError(Exception e) {
